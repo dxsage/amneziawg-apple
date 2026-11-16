@@ -49,6 +49,21 @@ public class WireGuardAdapter {
     private var pendingPathUpdate: DispatchWorkItem?
     private static let pathUpdateCoalescingDelay: DispatchTimeInterval = .milliseconds(500)
 
+    /// Uplink: the network the sockets were last set up for. iOS also reports a path update when only its link
+    /// quality or bandwidth estimate changes; such updates leave the sockets alone.
+    private struct NetworkIdentity: Equatable {
+        let primaryInterface: String?
+        let gateways: [String]
+
+        init(_ path: Network.NWPath) {
+            primaryInterface = path.availableInterfaces.first?.name
+            gateways = path.gateways.map { "\($0)" }
+        }
+    }
+    private var lastNetworkIdentity: NetworkIdentity?
+    /// Uplink: an unsatisfied update came since the sockets were set up, so the same network gets a rebind.
+    private var wentOfflineSinceIdentity = false
+
     /// Timestamp of last applied `NEPacketTunnelNetworkSettings` update.
     /// Used to suppress transient `.unsatisfied` events immediately after installing routes (common on Wi‑Fi with kill-switch routes).
     private var lastNetworkSettingsUpdateAt: Date?
@@ -247,6 +262,8 @@ public class WireGuardAdapter {
             self.networkMonitor = nil
             self.pendingPathUpdate?.cancel()
             self.pendingPathUpdate = nil
+            self.lastNetworkIdentity = nil
+            self.wentOfflineSinceIdentity = false
 
             self.state = .stopped
 
@@ -487,6 +504,24 @@ public class WireGuardAdapter {
         case .started(let handle, let settingsGenerator):
             self.updateEverHadHandshake(handle: handle)
             if path.status.isSatisfiable {
+                let identity = NetworkIdentity(path)
+                let previous = self.lastNetworkIdentity
+                let wentOffline = self.wentOfflineSinceIdentity
+                self.lastNetworkIdentity = identity
+                self.wentOfflineSinceIdentity = false
+                if identity == previous && !wentOffline {
+                    self.logHandler(.verbose, "Path update on the same network, sockets unchanged")
+                    return
+                }
+                if let previous = previous, previous.primaryInterface != identity.primaryInterface {
+                    // Uplink: Wi-Fi <-> cellular while the backend is running. Rebinding the sockets here left the tunnel
+                    // without replies (16.11.2026); a full backend restart, as after an offline gap, recovers at once.
+                    self.logHandler(.verbose, "Primary interface \(previous.primaryInterface ?? "-") -> \(identity.primaryInterface ?? "-"), restarting backend.")
+                    self.state = .temporaryShutdown(settingsGenerator)
+                    wgTurnOff(handle)
+                    self.didReceivePathUpdate(path: path)
+                    return
+                }
                 let (wgConfig, resolutionResults) = settingsGenerator.endpointUapiConfiguration()
                 self.logEndpointResolutionResults(resolutionResults)
 
@@ -494,6 +529,7 @@ public class WireGuardAdapter {
                 wgDisableSomeRoamingForBrokenMobileSemantics(handle)
                 wgBumpSockets(handle)
             } else {
+                self.wentOfflineSinceIdentity = true
                 if self.shouldPauseBackendOnUnsatisfiedPath() {
                     self.logHandler(.verbose, "Connectivity offline, pausing backend.")
 
@@ -513,6 +549,8 @@ public class WireGuardAdapter {
             guard path.status.isSatisfiable else { return }
 
             self.logHandler(.verbose, "Connectivity online, resuming backend.")
+            self.lastNetworkIdentity = NetworkIdentity(path)
+            self.wentOfflineSinceIdentity = false
 
             do {
                 let networkSettings = settingsGenerator.generateNetworkSettings()

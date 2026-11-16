@@ -44,6 +44,11 @@ public class WireGuardAdapter {
     /// Network routes monitor.
     private var networkMonitor: NWPathMonitor?
 
+    /// Uplink: a satisfied path update waiting for the end of a burst. iOS often sends 3-6 updates within half
+    /// a second with the same interfaces; sockets are rebound once, for the last one.
+    private var pendingPathUpdate: DispatchWorkItem?
+    private static let pathUpdateCoalescingDelay: DispatchTimeInterval = .milliseconds(500)
+
     /// Timestamp of last applied `NEPacketTunnelNetworkSettings` update.
     /// Used to suppress transient `.unsatisfied` events immediately after installing routes (common on Wi‑Fi with kill-switch routes).
     private var lastNetworkSettingsUpdateAt: Date?
@@ -191,7 +196,7 @@ public class WireGuardAdapter {
 
             let networkMonitor = NWPathMonitor()
             networkMonitor.pathUpdateHandler = { [weak self] path in
-                self?.didReceivePathUpdate(path: path)
+                self?.coalescePathUpdate(path: path)
             }
             networkMonitor.start(queue: self.workQueue)
 
@@ -240,6 +245,8 @@ public class WireGuardAdapter {
 
             self.networkMonitor?.cancel()
             self.networkMonitor = nil
+            self.pendingPathUpdate?.cancel()
+            self.pendingPathUpdate = nil
 
             self.state = .stopped
 
@@ -449,6 +456,23 @@ public class WireGuardAdapter {
 
     /// Helper method used by network path monitor.
     /// - Parameter path: new network path
+    /// Uplink: runs on `workQueue`. A lost network is handled at once; a satisfied update waits 0.5 s and
+    /// is replaced by the next one, so a burst of updates rebinds the sockets once.
+    private func coalescePathUpdate(path: Network.NWPath) {
+        pendingPathUpdate?.cancel()
+        pendingPathUpdate = nil
+        guard path.status.isSatisfiable else {
+            didReceivePathUpdate(path: path)
+            return
+        }
+        let item = DispatchWorkItem { [weak self] in
+            self?.pendingPathUpdate = nil
+            self?.didReceivePathUpdate(path: path)
+        }
+        pendingPathUpdate = item
+        workQueue.asyncAfter(deadline: .now() + Self.pathUpdateCoalescingDelay, execute: item)
+    }
+
     private func didReceivePathUpdate(path: Network.NWPath) {
         self.logHandler(.verbose, "Network change detected with \(path.status) route and interface order \(path.availableInterfaces)")
         let lastUpdate = self.lastNetworkSettingsUpdateAt.map { String(describing: $0) } ?? "nil"
